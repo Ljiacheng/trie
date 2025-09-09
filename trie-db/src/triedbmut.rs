@@ -31,7 +31,7 @@ use hash_db::{HashDB, Hasher, Prefix, EMPTY_PREFIX};
 use hashbrown::HashSet;
 
 #[cfg(feature = "std")]
-use log::trace;
+use log::{trace, debug};
 
 #[cfg(feature = "std")]
 use crate::rstd::fmt::{self, Debug};
@@ -707,6 +707,8 @@ impl<'db, L: TrieLayout> TrieDBMutBuilder<'db, L> {
 			storage: NodeStorage::empty(),
 			death_row: Default::default(),
 			root_handle,
+			#[cfg(feature = "std")]
+			time_map: std::collections::HashMap::default(),
 		}
 	}
 }
@@ -754,12 +756,23 @@ where
 	cache: Option<&'a mut dyn TrieCache<L::Codec>>,
 	/// Optional trie recorder for recording trie accesses.
 	recorder: Option<core::cell::RefCell<&'a mut dyn TrieRecorder<TrieHash<L>>>>,
+	#[cfg(feature = "std")]
+	time_map: std::collections::HashMap<String, u128>,
 }
 
 impl<'a, L> TrieDBMut<'a, L>
 where
 	L: TrieLayout,
 {
+	#[cfg(feature = "std")]
+	pub fn time(&mut self, key: &str, time: u128) {
+		if let Some(mut_time) = self.time_map.get_mut(&key.to_string()) {
+			*mut_time += time;
+		} else {
+			self.time_map.insert(key.to_string(), time);
+		}
+	}
+
 	/// Get the backing database.
 	pub fn db(&self) -> &dyn HashDB<L::Hash, DBValue> {
 		self.db
@@ -1803,13 +1816,19 @@ where
 	pub fn commit(&mut self) {
 		#[cfg(feature = "std")]
 		trace!(target: "trie", "Committing trie changes to db.");
+		#[cfg(feature = "std")]
+		let start = std::time::Instant::now();
 
 		// always kill all the nodes on death row.
 		#[cfg(feature = "std")]
 		trace!(target: "trie", "{:?} nodes to remove from db", self.death_row.len());
+		#[cfg(feature = "std")]
+		let tmp_start = std::time::Instant::now();
 		for (hash, prefix) in self.death_row.drain() {
 			self.db.remove(&hash, (&prefix.0[..], prefix.1));
 		}
+		#[cfg(feature = "std")]
+		self.time("db_remove_death_row", tmp_start.elapsed().as_micros());
 
 		let handle = match self.root_handle() {
 			NodeHandle::Hash(_) => return, // no changes necessary.
@@ -1829,7 +1848,11 @@ where
 					let mov = k.append_optional_slice_and_nibble(o_slice, o_index);
 					match node {
 						NodeToEncode::Node(value) => {
+							#[cfg(feature = "std")]
+							let tmp_start = std::time::Instant::now();
 							let value_hash = self.db.insert(k.as_prefix(), value);
+							#[cfg(feature = "std")]
+							self.time("db_insert", tmp_start.elapsed().as_micros());
 							self.cache_value(k.inner(), value, value_hash);
 							k.drop_lasts(mov);
 							ChildReference::Hash(value_hash)
@@ -1841,10 +1864,16 @@ where
 						},
 					}
 				});
-				#[cfg(feature = "std")]
-				trace!(target: "trie", "encoded root node: {:?}", ToHex(&encoded_root[..]));
 
+				#[cfg(feature = "std")]
+				let tmp_start = std::time::Instant::now();
+				#[cfg(feature = "std")]
+				let init_root = self.root.as_ref().to_vec();
 				*self.root = self.db.insert(EMPTY_PREFIX, &encoded_root);
+				#[cfg(feature = "std")]
+				trace!(target: "trie", "init root: {:?}, final root: {:?}, encoded root node: {:?}", ToHex(&init_root[..]), ToHex(&self.root.as_ref()), ToHex(&encoded_root[..]));
+				#[cfg(feature = "std")]
+				self.time("db_insert", tmp_start.elapsed().as_micros());
 				self.hash_count += 1;
 
 				self.cache_node(*self.root, &encoded_root, full_key);
@@ -1858,12 +1887,17 @@ where
 					NodeHandle::InMemory(self.storage.alloc(Stored::Cached(node, hash)));
 			},
 		}
+
+		#[cfg(feature = "std")]
+		debug!(target: "trie-dev", "commit trie use {} micros, {:?} micros", start.elapsed().as_micros(), self.time_map.clone().into_iter().collect::<Vec<_>>());
 	}
 
 	/// Cache the given `encoded` node.
 	fn cache_node(&mut self, hash: TrieHash<L>, encoded: &[u8], full_key: Option<NibbleVec>) {
 		// If we have a cache, cache our node directly.
 		if let Some(cache) = self.cache.as_mut() {
+			#[cfg(feature = "std")]
+			let tmp_start = std::time::Instant::now();
 			let node = cache.get_or_insert_node(hash, &mut || {
 				Ok(L::Codec::decode(&encoded)
 					.ok()
@@ -1913,6 +1947,8 @@ where
 
 			drop(node);
 			values_to_cache.into_iter().for_each(|(k, v)| cache.cache_value_for_key(&k, v));
+			#[cfg(feature = "std")]
+			self.time("cache_node", tmp_start.elapsed().as_micros());
 		}
 	}
 
@@ -1920,6 +1956,8 @@ where
 	///
 	/// `hash` is the hash of `value`.
 	fn cache_value(&mut self, full_key: &[u8], value: impl Into<Bytes>, hash: TrieHash<L>) {
+		#[cfg(feature = "std")]
+		let tmp_start = std::time::Instant::now();
 		if let Some(cache) = self.cache.as_mut() {
 			let value = value.into();
 
@@ -1937,6 +1975,8 @@ where
 				cache.cache_value_for_key(full_key, (value, hash).into())
 			}
 		}
+		#[cfg(feature = "std")]
+		self.time("db_insert", tmp_start.elapsed().as_micros());
 	}
 
 	/// Commit a node by hashing it and writing it to the db. Returns a
@@ -1971,8 +2011,11 @@ where
 								let mov = prefix.append_optional_slice_and_nibble(o_slice, o_index);
 								match node {
 									NodeToEncode::Node(value) => {
+										#[cfg(feature = "std")]
+										let tmp_start = std::time::Instant::now();
 										let value_hash = self.db.insert(prefix.as_prefix(), value);
-
+										#[cfg(feature = "std")]
+										self.time("db_insert", tmp_start.elapsed().as_micros());
 										self.cache_value(prefix.inner(), value, value_hash);
 
 										prefix.drop_lasts(mov);
@@ -1988,9 +2031,12 @@ where
 							node.into_encoded(commit_child)
 						};
 						if encoded.len() >= L::Hash::LENGTH {
+							#[cfg(feature = "std")]
+							let tmp_start = std::time::Instant::now();
 							let hash = self.db.insert(prefix.as_prefix(), &encoded);
+							#[cfg(feature = "std")]
+							self.time("db_insert", tmp_start.elapsed().as_micros());
 							self.hash_count += 1;
-
 							self.cache_node(hash, &encoded, full_key);
 
 							ChildReference::Hash(hash)
